@@ -12,17 +12,20 @@ Fonctionnalités :
   - Alertes Telegram (API officielle, via urllib — zéro dépendance)
   - Dashboard web intégré (http.server stdlib, aucune dépendance)
   - Mode daemon : scan régulier en boucle
+  - Mode bot : contrôle à distance via Telegram (/scan, /status...)
 
 Utilisation :
   python3 netmon.py --scan           # un scan, affiche le résultat
   python3 netmon.py --baseline       # sauvegarde l'état actuel comme référence
   python3 netmon.py --daemon         # boucle : scan + alertes à chaque intervalle
+  python3 netmon.py --bot            # scans automatiques + commandes Telegram
   python3 netmon.py --web            # dashboard web intégré (http://localhost:8080)
   python3 netmon.py --daemon --web   # charme absolu : daemon + dashboard
   python3 netmon.py --test-telegram  # envoie un message de test
 """
 
 import argparse
+import html
 import json
 import re
 import shutil
@@ -41,6 +44,11 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config.json"
 BASELINE_FILE = BASE_DIR / "devices.json"
 HISTORY_FILE = BASE_DIR / "history.jsonl"
+
+# État partagé entre le daemon de scan et le bot Telegram
+SCAN_LOCK = threading.Lock()
+LAST_STATE = {"ts": "", "online": 0}
+TP_OFFSET = 0  # offset de lecture des updates Telegram
 
 # ---------------------------------------------------------------- config
 
@@ -237,6 +245,12 @@ def describe(mac, info):
 
 
 def run_scan(config, baseline):
+    """Point d'entrée de scan : thread-safe (daemon et bot cohabitent)."""
+    with SCAN_LOCK:
+        return _scan_inner(config, baseline)
+
+
+def _scan_inner(config, baseline):
     network = config["network"]
     print(f"[*] Scan de {network} ...")
     current = scan_network(network)
@@ -299,6 +313,7 @@ def run_scan(config, baseline):
     baseline.update(current)
     save_baseline(baseline)
 
+    LAST_STATE.update(ts=history_entry["ts"], online=len(current))
     print(f"[*] Baseline mise à jour ({time.strftime('%H:%M:%S')}).")
     return current
 
@@ -313,6 +328,127 @@ def run_daemon(config):
         except Exception as exc:
             print(f"[!] Erreur pendant le scan : {exc}")
         time.sleep(interval)
+
+
+# ---------------------------------------------------------------- bot telegram
+
+
+def telegram_get_updates(config, wait=15):
+    """Récupère les messages reçus par le bot (polling). → tokens safe"""
+    global TP_OFFSET
+    t = config.get("telegram", {})
+    url = (
+        f"https://api.telegram.org/bot{t['bot_token']}/getUpdates"
+        f"?timeout={wait}&offset={TP_OFFSET}"
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=wait + 10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        print(f"[!] getUpdates : {exc}")
+        return []
+    out = []
+    for upd in data.get("result", []):
+        TP_OFFSET = max(TP_OFFSET, upd["update_id"] + 1)
+        msg = upd.get("message") or {}
+        text = (msg.get("text") or "").strip()
+        chat_id = (msg.get("chat") or {}).get("id")
+        if text and chat_id:
+            out.append((chat_id, text))
+    return out
+
+
+def bot_respond(config, chat_id, text):
+    """Traite une commande Telegram (/scan, /status...) et répond."""
+    cmd = text.split()[0].split("@")[0].lower()
+
+    if cmd in ("/start", "/help", "/commands"):
+        send_telegram(config, (
+            "🤖 <b>netmon — commandes</b>\n"
+            "/status — dernier scan (heure, nb en ligne)\n"
+            "/scan — lancer un scan immédiatement\n"
+            "/devices — appareils connus\n"
+            "/unknown — nouveaux du dernier scan\n"
+            "/recent — 5 derniers scans"
+        ))
+    elif cmd == "/status":
+        if LAST_STATE["ts"]:
+            send_telegram(config, (
+                f"📊 <b>Dernier scan</b>\n"
+                f"🕐 {html.escape(LAST_STATE['ts'])}\n"
+                f"📶 {LAST_STATE['online']} appareil(s) en ligne"
+            ))
+        else:
+            send_telegram(config, "⏳ Aucun scan effectué — attends le premier scan.")
+    elif cmd == "/scan":
+        send_telegram(config, "⏳ Scan en cours...")
+        run_scan(config, load_baseline())
+    elif cmd == "/devices":
+        devices = load_baseline()
+        if not devices:
+            send_telegram(config, "📭 Baseline vide — lance d'abord /scan")
+            return
+        lines = "\n".join(
+            f"• <code>{html.escape(info['ip'])}</code> "
+            f"{html.escape(info.get('vendor') or 'inconnu')}"
+            for info in list(devices.values())[:15]
+        )
+        more = f"\n... et {len(devices) - 15} autres" if len(devices) > 15 else ""
+        send_telegram(config, f"📱 <b>{len(devices)} appareil(s) connu(s)</b>\n{lines}{more}")
+    elif cmd == "/unknown":
+        hist = load_history(1)
+        news = hist[0]["new"] if hist else []
+        if news:
+            lines = []
+            for n in news:
+                os_part = f" · OS: {n['os']}" if n.get("os") else ""
+                lines.append(
+                    f"🚨 <code>{html.escape(n['ip'])}</code> "
+                    f"{html.escape(n['vendor'] or '?')}{os_part}"
+                )
+            send_telegram(config,
+                          f"🔍 <b>Appareils du dernier scan</b>\n" + "\n".join(lines))
+        else:
+            send_telegram(config, "✅ Aucun nouvel appareil au dernier scan.")
+    elif cmd == "/recent":
+        hist = load_history(5)
+        if not hist:
+            send_telegram(config, "📭 Aucun historique pour l'instant.")
+            return
+        lines = "\n".join(
+            f"• {html.escape(h['ts'])} — {h['online']} en ligne — "
+            f"{len(h['new'])} nouveau(x)"
+            for h in hist
+        )
+        send_telegram(config, f"📜 <b>5 derniers scans</b>\n{lines}")
+    else:
+        send_telegram(config, "🤔 Commande inconnue — /help pour la liste")
+
+
+def run_bot(config):
+    """Mode bot : scans périodiques en tâche de fond + commandes Telegram."""
+    interval = config.get("interval_sec", 300)
+
+    def periodic():
+        baseline = load_baseline()
+        while True:
+            try:
+                run_scan(config, baseline)
+            except Exception as exc:
+                print(f"[!] Scan périodique : {exc}")
+            time.sleep(interval)
+
+    threading.Thread(target=periodic, daemon=True).start()
+
+    allowed_chat = str(config["telegram"]["chat_id"])
+    print("[*] Bot Telegram lancé — envoie /help dans ton chat !")
+    while True:
+        for chat_id, text in telegram_get_updates(config):
+            if str(chat_id) != allowed_chat:
+                print(f"[!] Commande refuse de champ {chat_id} (non autorise).")
+                continue
+            print(f"[*] Commande Telegram : {text}")
+            bot_respond(config, chat_id, text)
 
 
 # ---------------------------------------------------------------- web
@@ -462,13 +598,16 @@ def main():
                         help="déclare l'état actuel comme référence")
     parser.add_argument("--daemon", action="store_true",
                         help="boucle de surveillance continue")
+    parser.add_argument("--bot", action="store_true",
+                        help="daemon + commandes Telegram (/scan, /status...)")
     parser.add_argument("--web", action="store_true",
                         help="dashboard web intégré")
     parser.add_argument("--test-telegram", action="store_true",
                         help="envoie un message de test Telegram")
     args = parser.parse_args()
 
-    if not any([args.scan, args.baseline, args.daemon, args.web, args.test_telegram]):
+    if not any([args.scan, args.baseline, args.daemon, args.bot, args.web,
+                args.test_telegram]):
         parser.print_help()
         return
 
@@ -496,6 +635,10 @@ def main():
 
     if web:
         start_web_server(config, foreground=not daemon)
+
+    if args.bot:
+        run_bot(config)      # s'arrête jamais : Ctrl+C
+        return
 
     if daemon:
         run_daemon(config)   # s'arrête jamais : Ctrl+C

@@ -65,7 +65,23 @@ python3 netmon.py --test-telegram   # vérifier la connexion Telegram
 python3 netmon.py --baseline        # enregistrer tes appareils actuels comme norme
 python3 netmon.py --scan            # scan unique + diff par rapport à la baseline
 python3 netmon.py --daemon          # surveillance continue
+python3 netmon.py --bot             # daemon + télécommande par messages Telegram
 ```
+
+## 🤖 Contrôle à distance par Telegram (`--bot`)
+
+Le mode bot lance les scans automatiques **et** traite tes messages — ton outil se pilote donc entièrement depuis Telegram, même à des kilomètres :
+
+| Commande | Effet |
+|---|---|
+| `/help` | liste des commandes |
+| `/status` | heure du dernier scan + nombre d'appareils en ligne |
+| `/scan` | déclenche un scan immédiat (+ alertes habituelles) |
+| `/devices` | liste des appareils connus (baseline) |
+| `/unknown` | appareils détectés lors du dernier scan |
+| `/recent` | les 5 derniers scans |
+
+🛡️ Sécurité intégrée : **seul le chat configuré** (`chat_id` du `config.json`) obtient une réponse — les autres sont ignorés.
 
 Résultat sur Telegram quand un inconnu apparaît :
 
