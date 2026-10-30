@@ -476,6 +476,10 @@ def main():
 
     if args.test_telegram:
         ok = send_telegram(config, "✅ <b>netmon</b> est bien connecté à Telegram !")
+        if ok:
+            print("✅ Message envoyé — va voir ton téléphone !")
+        else:
+            print("[!] Échec de l'envoi — regarde les logs au-dessus.")
         sys.exit(0 if ok else 1)
 
     if args.baseline:
