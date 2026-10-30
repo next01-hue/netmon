@@ -11,3 +11,5 @@ __pycache__/
 *.pyc
 .venv/
 aliases.json
+ports.json
+gw.json

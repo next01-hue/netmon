@@ -45,11 +45,14 @@ CONFIG_FILE = BASE_DIR / "config.json"
 BASELINE_FILE = BASE_DIR / "devices.json"
 HISTORY_FILE = BASE_DIR / "history.jsonl"
 ALIAS_FILE = BASE_DIR / "aliases.json"
+PORTS_FILE = BASE_DIR / "ports.json"
+GWSTATE_FILE = BASE_DIR / "gw.json"
 
 # État partagé entre le daemon de scan et le bot Telegram
 SCAN_LOCK = threading.Lock()
 LAST_STATE = {"ts": "", "online": 0}
 TP_OFFSET = 0  # offset de lecture des updates Telegram
+SCAN_CYCLE = 0  # compteur de cycles pour l'IDS
 
 # ---------------------------------------------------------------- config
 
@@ -215,6 +218,125 @@ def build_scan_args(config):
     return args, ports_cfg.get("timeout_sec", 120)
 
 
+# ---------------------------------------------------------------- ids
+
+
+def load_ports_base():
+    """Baseline des ports ouverts par appareil : {mac: {"ts":..., "ports":[...]}}."""
+    if PORTS_FILE.exists():
+        return json.loads(PORTS_FILE.read_text(encoding="utf-8"))
+    return {}
+
+
+def save_ports_base(ports_base):
+    PORTS_FILE.write_text(
+        json.dumps(ports_base, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def _get_gateway_mac():
+    """(ip, mac) de la passerelle. None si indéterminable."""
+    gw_ip, gw_mac = None, None
+    try:
+        route = subprocess.run(
+            ["ip", "route", "show", "default"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        gw_m = re.search(r"default via (\d+\.\d+\.\d+\.\d+)", route)
+        if gw_m:
+            gw_ip = gw_m.group(1)
+    except Exception:
+        pass
+    if not gw_ip:
+        # offshore : /proc/net/route (destination 00000000 = passerelle)
+        try:
+            for line in Path("/proc/net/route").read_text().splitlines()[1:]:
+                fields = line.split()
+                if len(fields) > 2 and fields[1] == "00000000":
+                    raw = fields[2]
+                    gw_ip = ".".join(
+                        str(int(raw[i:i + 2], 16)) for i in (6, 4, 2, 0)
+                    )
+                    break
+        except Exception:
+            pass
+    if not gw_ip:
+        return None
+    try:
+        neigh = subprocess.run(
+            ["ip", "neigh", "show", gw_ip],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        mac_m = re.search(r"lladdr\s+([0-9a-fA-F:]{17})", neigh)
+        if mac_m:
+            gw_mac = mac_m.group(1).upper()
+    except Exception:
+        pass
+    if not gw_mac:
+        # fallback : /proc/net/arp
+        try:
+            for line in Path("/proc/net/arp").read_text().splitlines()[1:]:
+                target, hw_flags, hw_addr = line.split()[0], line.split()[2], line.split()[3]
+                if target == gw_ip and len(hw_addr.split(":")) == 6 and hw_addr != "00:00:00:00:00:00":
+                    gw_mac = hw_addr.upper()
+                    break
+        except Exception:
+            pass
+    return (gw_ip, gw_mac) if gw_mac else None
+
+
+def ids_gateway_guard(config, ids_events):
+    """Gardien ARP : alerte si la MAC de la passerelle change (spoofing)."""
+    cfg = config.get("ids", {})
+    if not cfg.get("gateway_watch", True):
+        return
+    gw = _get_gateway_mac()
+    if not gw:
+        return
+    ip, mac = gw
+    state = {}
+    if GWSTATE_FILE.exists():
+        state = json.loads(GWSTATE_FILE.read_text(encoding="utf-8"))
+    old_mac = state.get("mac", "")
+    if old_mac and old_mac != mac:
+        ids_events.append({
+            "level": "CRIT",
+            "type": "arp_change",
+            "msg": (f"MAC de la passerelle {ip} a changé : "
+                    f"{old_mac} → {mac} (attaque ARP-spoofing possible ?)"),
+        })
+    state.update(ip=ip, mac=mac)
+    GWSTATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def ids_check_ports(config, ip, mac, entries, prior_ports, ids_events, warn_new=True):
+    """Diff les ports + détecte les ports suspects. Retourne l'état actuel."""
+    cfg = config.get("ids", {})
+    suspicious = cfg.get("suspicious_ports", [21, 23, 445, 3389, 5555, 5060])
+    alias = alias_of(mac)
+
+    ports_now = []
+    for port, service, _version in entries:
+        ports_now.append(f"{port}/tcp {service}")
+        if int(port) in suspicious:
+            ids_events.append({
+                "level": "CRIT",
+                "type": "suspicious_port",
+                "msg": (f"port suspect {port}/tcp ({service}) ouvert sur {ip}"
+                        + (f" ({alias})" if alias else "")),
+            })
+    if warn_new:
+        for ref in ports_now:
+            if ref not in prior_ports:
+                ids_events.append({
+                    "level": "WARN",
+                    "type": "new_port",
+                    "msg": (f"nouveau port ouvert sur {ip}"
+                            + (f" ({alias})" if alias else "") + f" : {ref}"),
+                })
+    return ports_now
+
+
 # ---------------------------------------------------------------- telegram
 
 
@@ -281,12 +403,20 @@ def _scan_inner(config, baseline):
     new_devices, vanished = compare(baseline, current, config.get("notify_vanished", False))
 
     messages = []
+    ids_events = []
     history_entry = {
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "online": len(current),
         "new": [],
         "vanished": [info["ip"] for info in vanished.values()],
+        "ids": ids_events,
     }
+
+    ids_cfg = config.get("ids", {})
+    global SCAN_CYCLE
+    SCAN_CYCLE += 1
+    if ids_cfg.get("enabled", True):
+        ids_gateway_guard(config, ids_events)
 
     if new_devices:
         lines = "\n".join(describe(mac, info) for mac, info in new_devices.items())
@@ -323,9 +453,47 @@ def _scan_inner(config, baseline):
                     print(f"      OS : {os_guess}")
                 messages.append(msg)
 
+                # IDS : premier état des ports d'un nouvel appareil
+                if entries:
+                    ports_base = load_ports_base()
+                    ports_now = ids_check_ports(
+                        config, ip, mac, entries, [], ids_events, warn_new=False
+                    )
+                    ports_base[mac] = {"ts": history_entry["ts"], "ports": ports_now}
+                    save_ports_base(ports_base)
+
+        # IDS : refresh périodique des appareils CONNUS (ports qui changent)
+        if ids_cfg.get("watch_known", True):
+            every = max(int(ids_cfg.get("rescan_every", 2)), 1)
+            if SCAN_CYCLE % every == 1:
+                args_known = ids_cfg.get(
+                    "known_scan_args", ["-sT", "--top-ports", "100"]
+                )
+                timeout = int(ids_cfg.get("timeout_sec", 120))
+                ports_base = load_ports_base()
+                for mac, info in current.items():
+                    if mac not in baseline:  # nouveaux : déjà traités au-dessus
+                        continue
+                    ip_known = info["ip"]
+                    prior = ports_base.get(mac, {}).get("ports", [])
+                    print(f"  [*] IDS pulse sur {ip_known} ...")
+                    entries_k, _ = port_scan(ip_known, args_known, timeout)
+                    if not entries_k:
+                        continue  # scan vide (éteint/bloqué) : on ne casse pas la base
+                    ports_now = ids_check_ports(
+                        config, ip_known, mac, entries_k, prior, ids_events
+                    )
+                    ports_base[mac] = {"ts": history_entry["ts"], "ports": ports_now}
+                    save_ports_base(ports_base)
+
     if vanished:
         lines = "\n".join(describe(mac, info) for mac, info in vanished.items())
         messages.append(f"💤 <b>Appareils absents</b>\n{lines}")
+
+    for ev in ids_events:
+        icon = "🔴" if ev["level"] == "CRIT" else "🟠"
+        print(f"  ⚠️ IDS [{ev['level']}] {ev['msg']}")
+        messages.append(f"🛡️ <b>netmon IDS</b>\n{icon} <b>{ev['level']}</b> — {ev['msg']}")
 
     append_history(history_entry)
 
@@ -392,7 +560,8 @@ def bot_respond(config, chat_id, text):
             "/devices — appareils connus\n"
             "/name <ip> <nom> — renommer un appareil (ex : /name 192.168.1.42 TV salon)\n"
             "/unknown — nouveaux du dernier scan\n"
-            "/recent — 5 derniers scans"
+            "/recent — 5 derniers scans\n"
+            "/events — dernières alertes IDS"
         ))
     elif cmd == "/status":
         if LAST_STATE["ts"]:
@@ -453,6 +622,16 @@ def bot_respond(config, chat_id, text):
             lines.append(f"• <code>{ip}</code> {vendor}{tag}")
         more = f"\n... et {len(devices) - 15} autres" if len(devices) > 15 else ""
         send_telegram(config, f"📱 <b>{len(devices)} appareil(s) connu(s)</b>\n" + "\n".join(lines) + more)
+    elif cmd == "/events":
+        evts = [e for h in load_history(10) for e in h.get("ids", [])]
+        if not evts:
+            send_telegram(config, "✅ Aucun événement IDS — réseau calme.")
+            return
+        lines = []
+        for e in evts[:10]:
+            icon = "🔴" if e["level"] == "CRIT" else "🟠"
+            lines.append(f"{icon} <b>{e['level']}</b> — {html.escape(e['msg'])}")
+        send_telegram(config, "🛡️ <b>Alertes IDS récentes</b>\n" + "\n".join(lines))
     elif cmd == "/unknown":
         hist = load_history(1)
         news = hist[0]["new"] if hist else []

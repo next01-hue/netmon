@@ -72,6 +72,24 @@ python3 netmon.py --bot             # daemon + télécommande par messages Teleg
 
 Le mode bot lance les scans automatiques **et** traite tes messages — ton outil se pilote donc entièrement depuis Telegram, même à des kilomètres :
 
+## 🛡️ Détections IDS intégrées (v3)
+
+Au-delà des **nouveaux appareils**, netmon surveille les comportements anormaux :
+
+| Détection | Ligne d'alerte | Ce que ça dévoie |
+|---|---|---|
+| Appareil inconnu | 🚨 **Nouveau appareil** | intrus (voisin, attaqu physique...) |
+| Nouveau **port ouvert** sur un appareil connu | 🟠 **WARN — nouveau port** | logiciel hébergé suspect installé |
+| **Port suspect** ouvert (telnet 23, SMB 445, RDP 3389, ADB 5555…) | 🔴 **CRIT — port suspect** | service dangereux exposé |
+| MAC de la **passerelle a changé** | 🔴 **CRIT — ARP-spoofing possible ?** | un pirate se fait passer pour ta box (MITM) |
+
+- Les alertes sont aussi dans `history.jsonl` (champ `ids`) et consultables via `/events`.
+- La baseline des ports viv dans `ports.json` (diff automatique à chaque pulse).
+- Configurable dans la section `ids` du `config.json` (désactiver casuellement `watch_known`,
+  ajouter des ports suspects, fixer `rescan_every` : 1 = pulse à chaque cycle, 3 = un cycle sur trois).
+
+**Limiter les faux positifs** : après un changement légitime (mise à jour de la box, service que tu installes toi-même), les alertes `/events` te préviennent à tort. La méthode pro : tu **vérifies** que l'événement est bénin puis tu effaces la baseline concernée (`rm ports.json` → le prochain scan la recrée) — c'est le classique cycle IDS « alerte → investigation → triage ». Réseau calme = pas d'events ; un changement inexplicable = une vraie piste d'intrusion.
+
 | Commande | Effet |
 |---|---|
 | `/help` | liste des commandes |
