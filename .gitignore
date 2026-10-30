@@ -1,0 +1,12 @@
+# Config avec secrets (token Telegram) — ne JAMAIS la pousser sur GitHub
+config.json
+
+# Données personnelles générées pendant l'exécution
+devices.json
+history.jsonl
+log.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/

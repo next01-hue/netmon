@@ -1,0 +1,19 @@
+{
+  "network": "192.168.1.0/24",
+  "interval_sec": 300,
+  "notify_vanished": false,
+  "os_detection": false,
+  "port_scan": {
+    "enabled": true,
+    "args": ["-sV", "--top-ports", "100"],
+    "timeout_sec": 120
+  },
+  "web": {
+    "port": 8080,
+    "bind": "0.0.0.0"
+  },
+  "telegram": {
+    "bot_token": "COLLE_ICI_LE_TOKEN_DE_TON_BOT",
+    "chat_id": "COLLE_ICI_TON_CHAT_ID"
+  }
+}
