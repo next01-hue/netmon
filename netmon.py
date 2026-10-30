@@ -44,6 +44,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config.json"
 BASELINE_FILE = BASE_DIR / "devices.json"
 HISTORY_FILE = BASE_DIR / "history.jsonl"
+ALIAS_FILE = BASE_DIR / "aliases.json"
 
 # État partagé entre le daemon de scan et le bot Telegram
 SCAN_LOCK = threading.Lock()
@@ -73,6 +74,23 @@ def save_baseline(devices):
     BASELINE_FILE.write_text(
         json.dumps(devices, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+
+
+def load_aliases():
+    """Alias lisibles des appareils : {mac: "TV du salon", ...}."""
+    if ALIAS_FILE.exists():
+        return json.loads(ALIAS_FILE.read_text(encoding="utf-8"))
+    return {}
+
+
+def save_aliases(aliases):
+    ALIAS_FILE.write_text(
+        json.dumps(aliases, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def alias_of(mac):
+    return load_aliases().get(mac, "")
 
 
 def append_history(entry):
@@ -241,7 +259,11 @@ def compare(baseline, current, notify_vanished=False):
 
 def describe(mac, info):
     vendor = info.get("vendor") or "fabricant inconnu"
-    return f"📱 <code>{mac}</code> @ <code>{info['ip']}</code> ({vendor})"
+    line = f"📱 <code>{mac}</code> @ <code>{info['ip']}</code> ({vendor})"
+    alias = alias_of(mac)
+    if alias:
+        line += f"\n   👤 <b>{html.escape(alias)}</b>"
+    return line
 
 
 def run_scan(config, baseline):
@@ -368,6 +390,7 @@ def bot_respond(config, chat_id, text):
             "/status — dernier scan (heure, nb en ligne)\n"
             "/scan — lancer un scan immédiatement\n"
             "/devices — appareils connus\n"
+            "/name <ip> <nom> — renommer un appareil (ex : /name 192.168.1.42 TV salon)\n"
             "/unknown — nouveaux du dernier scan\n"
             "/recent — 5 derniers scans"
         ))
@@ -383,18 +406,53 @@ def bot_respond(config, chat_id, text):
     elif cmd == "/scan":
         send_telegram(config, "⏳ Scan en cours...")
         run_scan(config, load_baseline())
+    elif cmd == "/name":
+        parts = text.split(maxsplit=2)
+        if len(parts) < 3:
+            send_telegram(config,
+                          "💡 Usage : /name <ip_ou_mac> <petit nom>\n"
+                          "ex : /name 192.168.1.42 TV du salon")
+            return
+        target, label = parts[1], parts[2].strip()
+        devices = load_baseline()
+        mac = None
+        if target.upper() in devices:
+            mac = target.upper()
+        else:
+            for m, info in devices.items():
+                if info["ip"] == target:
+                    mac = m
+                    break
+        if not mac:
+            send_telegram(config, f"🤔 {target} introuvable — regarde /devices")
+            return
+        aliases = load_aliases()
+        aliases[mac] = label
+        save_aliases(aliases)
+        info = devices[mac]
+        send_telegram(config, (
+            f"🏷️ Alias enregistré !\n"
+            f"<code>{html.escape(info['ip'])}</code> → "
+            f"<b>{html.escape(label)}</b>"
+        ))
     elif cmd == "/devices":
         devices = load_baseline()
         if not devices:
             send_telegram(config, "📭 Baseline vide — lance d'abord /scan")
             return
-        lines = "\n".join(
-            f"• <code>{html.escape(info['ip'])}</code> "
-            f"{html.escape(info.get('vendor') or 'inconnu')}"
-            for info in list(devices.values())[:15]
-        )
+        aliases = load_aliases()
+        lines = []
+        for info in list(devices.values())[:15]:
+            ip = html.escape(info["ip"])
+            vendor = html.escape(info.get("vendor") or "inconnu")
+            alias = next(
+                (a for m, a in aliases.items() if devices[m]["ip"] == info["ip"]),
+                ""
+            )
+            tag = f" 👤 <b>{html.escape(alias)}</b>" if alias else ""
+            lines.append(f"• <code>{ip}</code> {vendor}{tag}")
         more = f"\n... et {len(devices) - 15} autres" if len(devices) > 15 else ""
-        send_telegram(config, f"📱 <b>{len(devices)} appareil(s) connu(s)</b>\n{lines}{more}")
+        send_telegram(config, f"📱 <b>{len(devices)} appareil(s) connu(s)</b>\n" + "\n".join(lines) + more)
     elif cmd == "/unknown":
         hist = load_history(1)
         news = hist[0]["new"] if hist else []

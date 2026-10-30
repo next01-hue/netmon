@@ -77,7 +77,8 @@ Le mode bot lance les scans automatiques **et** traite tes messages — ton outi
 | `/help` | liste des commandes |
 | `/status` | heure du dernier scan + nombre d'appareils en ligne |
 | `/scan` | déclenche un scan immédiat (+ alertes habituelles) |
-| `/devices` | liste des appareils connus (baseline) |
+| `/devices` | liste des appareils connus (baseline) + leurs alias |
+| `/name <ip> <nom>` | renomme un appareil (ex: `/name 192.168.1.42 TV salon`) — enregistré dans `aliases.json` |
 | `/unknown` | appareils détectés lors du dernier scan |
 | `/recent` | les 5 derniers scans |
 
