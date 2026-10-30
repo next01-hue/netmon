@@ -634,7 +634,7 @@ def main():
     web = args.web
 
     if web:
-        start_web_server(config, foreground=not daemon)
+        start_web_server(config, foreground=not (daemon or args.bot))
 
     if args.bot:
         run_bot(config)      # s'arrête jamais : Ctrl+C
