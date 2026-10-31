@@ -4,6 +4,7 @@ config.json
 # Données personnelles générées pendant l'exécution
 devices.json
 history.jsonl
+export/
 log.txt
 
 # Python

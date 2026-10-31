@@ -10,6 +10,7 @@ tx Wi-Fi, box piratée...). Idéal pour surveiller son réseau domestique.
 - ✅ Alertes Telegram (API officielle)
 - ✅ Baseline persistante dans `devices.json`
 - ✅ Mode daemon : scan automatique toutes les X secondes
+- ✅ (v4) Dossier enrichi par appareil + graphique de présence + export CSV/JSON
 
 ---
 
@@ -90,6 +91,39 @@ Au-delà des **nouveaux appareils**, netmon surveille les comportements anormaux
 
 **Limiter les faux positifs** : après un changement légitime (mise à jour de la box, service que tu installes toi-même), les alertes `/events` te préviennent à tort. La méthode pro : tu **vérifies** que l'événement est bénin puis tu effaces la baseline concernée (`rm ports.json` → le prochain scan la recrée) — c'est le classique cycle IDS « alerte → investigation → triage ». Réseau calme = pas d'events ; un changement inexplicable = une vraie piste d'intrusion.
 
+## 🕵️ Dossiers enrichis (v4)
+
+Chaque appareil obtient un vrai dossier d'identité dans `devices.json` :
+
+| Info | Comment ça s'obtient |
+|---|---|
+| **Hostname** | reverse DNS de l'IP |
+| **OS (TTL)** | 1 ping ICMP : TTL 128 → Windows, 64 → Linux/Android/macOS, 255 → équipement réseau |
+| **Bannière HTTP** | entêtes `Server` / auth des ports 80/8080 (révèle souvent le modèle exact de la TV/box !) |
+| **Type** | heuristique fabricant + ports + hostname : Box/routeur, TV, Chromecast, Apple TV, iPhone, imprimante, NAS, caméra IP, PC Windows, Raspberry Pi, domotique… avec un **% de confiance** |
+| **Présence** | `first_seen` (1er contact), `last_seen`, compteur de scans où il était là |
+
+Le tout configurable dans `config.json` :
+
+```json
+"enrich": {
+  "enabled": true,
+  "reverse_dns": true,
+  "ping_ttl": true,
+  "compare_gateway": true
+}
+```
+
+> Remarque : le « pulse » IDS périodique tourne désormais sur **tous** les appareils
+> connus (pas seulement quand un inconnu apparaît) — ports **et** dossier se
+> rafraîchissent au rythme de `rescan_every`.
+
+| Commande | Effet |
+|---|---|
+| `/info <ip>` | dossier complet d'un appareil : fabricant, hostname, type (confiance), OS, ports, bannière HTTP, 1er/dernier contact |
+| `/export` | reçois `devices` en **CSV** ; `/export json` pour le dossier complet en JSON |
+| `/events` | dernières alertes IDS |
+
 | Commande | Effet |
 |---|---|
 | `/help` | liste des commandes |
@@ -99,6 +133,9 @@ Au-delà des **nouveaux appareils**, netmon surveille les comportements anormaux
 | `/name <ip> <nom>` | renomme un appareil (ex: `/name 192.168.1.42 TV salon`) — enregistré dans `aliases.json` |
 | `/unknown` | appareils détectés lors du dernier scan |
 | `/recent` | les 5 derniers scans |
+| `/events` | dernières alertes IDS |
+| `/info <ip>` | dossier détaillé d'un appareil 🕵️ (v4) |
+| `/export` | base envoyée en document : CSV (`/export`) ou JSON (`/export json`) (v4) |
 
 🛡️ Sécurité intégrée : **seul le chat configuré** (`chat_id` du `config.json`) obtient une réponse — les autres sont ignorés.
 
@@ -133,10 +170,10 @@ chmod +x ~/.termux/boot/netmon.sh
 ## 🧠 Idées d'évolution (pour aller plus loin)
 
 - [x] Scan de ports sur les nouveaux appareils (`nmap -sV`) ✅
+- [x] Dossiers enrichis : hostname, TTL OS, bannière HTTP, classification ✅ (v4)
+- [x] Export CSV / JSON + graphique de présence dans le dashboard ✅ (v4)
 - [ ] Notification avec capture d'écran / image du scan
-- [ ] Interface web légère (Flask) consultable depuis le téléphone
-- [ ] Export CSV / graphique de présence des appareils
-- [ ] Reconnaissance OS des nouveaux hôtes
+- [ ] Alertes automatiques Telegram sur changement sans ta commande (déjà actif en mode daemon/bot via les scans périodiques 🎉)
 
 ---
 Projet éducatif — apprendre la cybersécurité défensive sur mobile. 🐍

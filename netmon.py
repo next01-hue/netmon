@@ -11,6 +11,11 @@ Fonctionnalités :
   - Historique des scans (history.jsonl) consultable sur le dashboard web
   - Alertes Telegram (API officielle, via urllib — zéro dépendance)
   - Dashboard web intégré (http.server stdlib, aucune dépendance)
+  - Dossier enrichi des appareils (v4) : hostname rDNS, TTL OS, bannière HTTP,
+    classification heuristique (box, TV, imprimante, NAS, smartphone...)
+  - Traces de présence : first_seen / last_seen / compteur de scans (v4)
+  - Dossier détaillé par Telegram (/info) + export CSV/JSON (/export) (v4)
+  - Dashboard web avec graphique de présence (v4)
   - Mode daemon : scan régulier en boucle
   - Mode bot : contrôle à distance via Telegram (/scan, /status...)
 
@@ -25,6 +30,7 @@ Utilisation :
 """
 
 import argparse
+import csv
 import html
 import json
 import re
@@ -36,6 +42,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -47,6 +54,7 @@ HISTORY_FILE = BASE_DIR / "history.jsonl"
 ALIAS_FILE = BASE_DIR / "aliases.json"
 PORTS_FILE = BASE_DIR / "ports.json"
 GWSTATE_FILE = BASE_DIR / "gw.json"
+EXPORT_DIR = BASE_DIR / "export"
 
 # État partagé entre le daemon de scan et le bot Telegram
 SCAN_LOCK = threading.Lock()
@@ -337,7 +345,224 @@ def ids_check_ports(config, ip, mac, entries, prior_ports, ids_events, warn_new=
     return ports_now
 
 
-# ---------------------------------------------------------------- telegram
+# ---------------------------------------------------------------- enrich
+# Dossier d'identité des appareils (v4) : hostname rDNS, TTL OS, bannière
+# HTTP, classification heuristique — la partie « agent fédéral » 🕵️
+
+OUI_EXTRA = {
+    # Repli quand nmap ne fournit pas le vendeur (préfixes MAC connus)
+    "00:09:B0": "Nintendo", "00:16:32": "Sony", "00:17:88": "Philips Hue",
+    "00:1A:11": "Google", "3C:5A:B4": "Xiaomi", "50:C7:BF": "TP-Link",
+    "B8:27:EB": "Raspberry Pi", "DC:A6:32": "Raspberry Pi",
+    "E4:5F:01": "Raspberry Pi",
+}
+
+WELL_KNOWN = {
+    21: "FTP", 22: "SSH (admin distante)", 23: "Telnet (⚠ non chiffré)",
+    25: "SMTP (mail)", 53: "DNS", 80: "Web", 111: "RPC/NFS",
+    135: "RPC Windows", 139: "NetBIOS (partage Windows)", 443: "HTTPS",
+    445: "SMB (partage Windows)", 515: "Impression LPD",
+    548: "Partage Apple (AFP)", 554: "RTSP (flux caméra)",
+    631: "Impression IPP", 1900: "UPnP", 3389: "RDP (bureau distant)",
+    5000: "NAS Synology", 5555: "ADB (⚠ Android)",
+    5900: "VNC", 7000: "AirPlay", 8008: "Google Cast",
+    8009: "Google Cast/Chromecast", 9100: "Impression brute (JetDirect)",
+    62078: "usbmuxd (iPhone/iPad)",
+}
+
+
+def vendor_of(mac, nmap_vendor):
+    """Vendeur : nmap en priorité, sinon banque OUI offline."""
+    if nmap_vendor:
+        return nmap_vendor
+    return OUI_EXTRA.get(mac[:8], "")
+
+
+def reverse_dns(ip):
+    """Nom d'hôte (reverse DNS) d'une IP. '' si rien trouvé."""
+    try:
+        host, _, _ = socket.gethostbyaddr(ip)
+        return host.rstrip(".")
+    except Exception:
+        return ""
+
+
+def ttl_os_family(ttl):
+    """Conjecture d'OS via le TTL ICMP (sur un LAN, pas de saut de routeur)."""
+    if not ttl:
+        return ""
+    ttl = int(ttl)
+    if ttl >= 240:
+        return f"équipement réseau / Unix (TTL {ttl})"
+    if ttl >= 120:
+        return f"Windows (TTL {ttl})"
+    if ttl >= 55:
+        return f"Linux / Android / macOS (TTL {ttl})"
+    return f"OS inconnu (TTL {ttl})"
+
+
+def ping_ttl(ip):
+    """TTL mesuré avec 1 ping ICMP → None si ping indisponible/échec."""
+    ping = shutil.which("ping")
+    if not ping:
+        return None
+    try:
+        out = subprocess.run(
+            [ping, "-c", "1", "-W", "1", ip],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        m = re.search(r"ttl[= ](\d+)", out, re.IGNORECASE)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+def http_banner(ip, port):
+    """Entête HTTP « Server » / auth d'un service web. '' si rien."""
+    if int(port) not in (80, 8080):
+        return ""
+    try:
+        req = urllib.request.Request(
+            f"http://{ip}:{port}/", headers={"User-Agent": "netmon/4"}
+        )
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            return (
+                resp.headers.get("Server", "")
+                or resp.headers.get("WWW-Authenticate", "")
+            )
+    except Exception:
+        return ""
+
+
+GW_CACHE = {"ip": ""}
+
+
+def gateway_ip():
+    """IP de la passerelle locale (détectée une fois puis mise en cache)."""
+    if not GW_CACHE["ip"]:
+        gw = _get_gateway_mac()
+        if gw:
+            GW_CACHE["ip"] = gw[0]
+    return GW_CACHE["ip"]
+
+
+def classify_device(ip, gw_ip, vendor, hostname, port_entries, os_guess):
+    """Heuristique de classification → (type, confiance %, notes)."""
+    apset = {int(p) for p, _s, _v in port_entries if str(p).isdigit()}
+    vend = (vendor or "").lower()
+    host = (hostname or "").lower()
+    osl = (os_guess or "").lower()
+    notes = []
+
+    if gw_ip and ip == gw_ip:
+        notes.append("c'est l'IP de la passerelle")
+        return "Box / routeur", 98, notes
+
+    if os_guess:
+        notes.append(f"OS nmap : {os_guess}")
+
+    # ---------- Apple
+    if "apple" in vend:
+        if 7000 in apset:
+            return "Apple TV (AirPlay)", 92, notes
+        if 62078 in apset:
+            return "iPhone / iPad", 90, notes
+        if apset & {22, 548}:
+            return "Mac (SSH / partage)", 85, notes
+        return "Appareil Apple (iPhone / iPad / Mac probable)", 60, notes
+
+    # ---------- Raspberry Pi
+    if "raspberry" in vend:
+        return "Raspberry Pi", 95, notes
+
+    # ---------- imprimante
+    if apset & {9100, 631, 515}:
+        return "Imprimante / serveur d'impression", 85, notes
+
+    # ---------- TV / clés multimédia
+    if apset & {8008, 8009}:
+        if "chromecast" in host:
+            return "Chromecast", 90, notes
+        return "Clé HDMI / Google Cast (probable)", 75, notes
+    if "roku" in vend or 9060 in apset:
+        return "Box TV (Roku)", 85, notes
+    if apset & {8001, 8002}:
+        return "TV connectée (LG / Samsung)", 80, notes
+
+    # ---------- caméra
+    if 554 in apset:
+        return "Caméra IP / NVR", 80, notes
+
+    # ---------- NAS
+    if apset & {5000, 5001, 9000}:
+        return "NAS", 80, notes
+    if apset & {445, 139} and "linux" in osl:
+        return "Serveur / NAS Linux (Samba)", 70, notes
+
+    # ---------- PC Windows
+    if "windows" in osl:
+        return "PC Windows", 85, notes
+    if apset & {135, 3389}:
+        return "PC Windows (RPC / RDP)", 75, notes
+
+    # ---------- smartphones Android génériques
+    if any(k in vend for k in (
+            "xiaomi", "huawei", "honor", "oppo", "realme", "oneplus",
+            "vivo", "motorola", "alcatel")):
+        return "Smartphone / tablette Android (probable)", 70, notes
+
+    # ---------- indices de nom d'hôte
+    HOST_KEYWORDS = (
+        ("iphone", "iPhone"), ("ipad", "iPad"),
+        ("galaxy", "Smartphone Samsung"), ("pixel", "Smartphone Google"),
+        ("android", "Smartphone Android"), ("chromecast", "Chromecast"),
+        ("nest", "Enceinte / hub Google"), ("echo", "Enceinte Amazon"),
+        ("syno", "NAS"), ("nas", "NAS"), ("printer", "Imprimante"),
+        ("shelly", "Objet domotique (Shelly)"), ("esp-", "Objet domotique (ESP)"),
+        ("hue", "Pont Hue / domotique"), ("tv", "TV / appareil multimédia"),
+    )
+    for kw, label in HOST_KEYWORDS:
+        if kw in host:
+            notes.append(f"hostname contient « {kw} »")
+            return label, 80, notes
+
+    return "À identifier (pas assez d'indices)", 15, notes
+
+
+def enrich_device(ip, mac, vendor, port_entries, os_guess, enrich_cfg=None):
+    """Construit le « dossier » d'un appareil (hostname, TTL, OS, type...)."""
+    enrich_cfg = enrich_cfg or {}
+    if not enrich_cfg.get("enabled", True):
+        return {}
+    host = reverse_dns(ip) if enrich_cfg.get("reverse_dns", True) else ""
+    ttl = ping_ttl(ip) if enrich_cfg.get("ping_ttl", True) else None
+    server = ""
+    for port, _svc, _ver in port_entries:
+        if int(port) in (80, 8080):
+            server = http_banner(ip, int(port))
+            if server:
+                break
+    ptype, conf, notes = classify_device(
+        ip, gateway_ip() if enrich_cfg.get("compare_gateway", True) else "",
+        vendor, host, port_entries, os_guess,
+    )
+    if server:
+        notes.append(f"bannière HTTP : {server}")
+    rec = {
+        "hostname": host,
+        "ttl": ttl,
+        "os_family": ttl_os_family(ttl) if ttl else "",
+        "type": ptype,
+        "confidence": conf,
+        "notes": notes,
+    }
+    if os_guess:
+        rec["os"] = os_guess
+    if server:
+        rec["banner"] = server
+    return rec
+
+
 
 
 def send_telegram(config, message):
@@ -365,6 +590,79 @@ def send_telegram(config, message):
         return False
 
 
+def send_telegram_document(config, path, caption=""):
+    """Envoie un fichier au chat (multipart/form-data, stdlib uniquement)."""
+    t = config.get("telegram", {})
+    if not t.get("bot_token") or not t.get("chat_id"):
+        print("[i] Telegram non configuré — document non envoyé :", path)
+        return False
+    boundary = f"----netmon{uuid.uuid4().hex}"
+    parts = []
+    for key, value in (("chat_id", t["chat_id"]), ("caption", caption)):
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; "
+            f"name=\"{key}\"\r\n\r\n{value}\r\n".encode()
+        )
+    mime = "text/csv" if path.suffix == ".csv" else "application/json"
+    parts.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; "
+        f"filename=\"{path.name}\"\r\nContent-Type: {mime}\r\n\r\n".encode()
+    )
+    parts.append(path.read_bytes() + f"\r\n--{boundary}--\r\n".encode())
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{t['bot_token']}/sendDocument",
+        data=b"".join(parts),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            return bool(result.get("ok"))
+    except Exception as exc:
+        print(f"[!] Envoi document Telegram : {exc}")
+        return False
+
+
+def export_devices_csv(path):
+    """Baseline + dossiers enrichis → tableau CSV lisible."""
+    devices = load_baseline()
+    aliases = load_aliases()
+    ports_base = load_ports_base()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["mac", "ip", "alias", "fabricant", "hostname", "type",
+                         "confiance", "os", "premier_contact",
+                         "dernier_apercu", "vus", "ports"])
+        for mac, rec in devices.items():
+            writer.writerow([
+                mac, rec.get("ip", ""), aliases.get(mac, ""),
+                rec.get("vendor", ""), rec.get("hostname", ""),
+                rec.get("type", ""), rec.get("confidence", ""),
+                rec.get("os_family", "") or rec.get("os", ""),
+                rec.get("first_seen", ""), rec.get("last_seen", ""),
+                rec.get("seen", ""),
+                "; ".join(ports_base.get(mac, {}).get("ports", [])),
+            ])
+    return path
+
+
+def export_devices_json(path):
+    """« Dossier complet » JSON : baseline + alias + baseline ports."""
+    payload = {
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "aliases": load_aliases(),
+        "ports": load_ports_base(),
+        "devices": load_baseline(),
+    }
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return path
+
+
 # ---------------------------------------------------------------- logique
 
 
@@ -381,7 +679,9 @@ def compare(baseline, current, notify_vanished=False):
 
 def describe(mac, info):
     vendor = info.get("vendor") or "fabricant inconnu"
-    line = f"📱 <code>{mac}</code> @ <code>{info['ip']}</code> ({vendor})"
+    typ = info.get("type", "")
+    extra = f" · {typ}" if typ else ""
+    line = f"📱 <code>{mac}</code> @ <code>{info['ip']}</code> ({vendor}){extra}"
     alias = alias_of(mac)
     if alias:
         line += f"\n   👤 <b>{html.escape(alias)}</b>"
@@ -432,12 +732,18 @@ def _scan_inner(config, baseline):
                 ip = info["ip"]
                 print(f"  [*] Scan de ports sur {ip} ...")
                 entries, os_guess = port_scan(ip, args, timeout)
+                dossier = enrich_device(
+                    ip, mac, info.get("vendor", ""), entries, os_guess,
+                    config.get("enrich", {}),
+                )
+                baseline.setdefault(mac, {}).update(dossier)
                 device_record = {
                     "mac": mac,
                     "ip": ip,
                     "vendor": info.get("vendor", ""),
                     "ports": [f"{p}/tcp {s}" for p, s, _ in entries[:15]],
                     "os": os_guess,
+                    **dossier,
                 }
                 history_entry["new"].append(device_record)
 
@@ -462,29 +768,46 @@ def _scan_inner(config, baseline):
                     ports_base[mac] = {"ts": history_entry["ts"], "ports": ports_now}
                     save_ports_base(ports_base)
 
-        # IDS : refresh périodique des appareils CONNUS (ports qui changent)
-        if ids_cfg.get("watch_known", True):
-            every = max(int(ids_cfg.get("rescan_every", 2)), 1)
-            if SCAN_CYCLE % every == 1:
-                args_known = ids_cfg.get(
-                    "known_scan_args", ["-sT", "--top-ports", "100"]
+        else:
+            # Scan de ports désactivé : dossier léger (rDNS, TTL, classification)
+            for mac, info in new_devices.items():
+                dossier = enrich_device(
+                    info["ip"], mac, info.get("vendor", ""), [], "",
+                    config.get("enrich", {}),
                 )
-                timeout = int(ids_cfg.get("timeout_sec", 120))
-                ports_base = load_ports_base()
-                for mac, info in current.items():
-                    if mac not in baseline:  # nouveaux : déjà traités au-dessus
-                        continue
-                    ip_known = info["ip"]
-                    prior = ports_base.get(mac, {}).get("ports", [])
-                    print(f"  [*] IDS pulse sur {ip_known} ...")
-                    entries_k, _ = port_scan(ip_known, args_known, timeout)
-                    if not entries_k:
-                        continue  # scan vide (éteint/bloqué) : on ne casse pas la base
-                    ports_now = ids_check_ports(
-                        config, ip_known, mac, entries_k, prior, ids_events
+                baseline.setdefault(mac, {}).update(dossier)
+
+    # IDS : pulse périodique sur les appareils CONNUS, même sans nouveaux
+    # (diff des ports + rafraîchissement du dossier d'identité)
+    if ids_cfg.get("watch_known", True):
+        every = max(int(ids_cfg.get("rescan_every", 2)), 1)
+        if SCAN_CYCLE % every == 1:
+            args_known = ids_cfg.get(
+                "known_scan_args", ["-sT", "--top-ports", "100"]
+            )
+            timeout = int(ids_cfg.get("timeout_sec", 120))
+            ports_base = load_ports_base()
+            for mac, info in current.items():
+                if mac not in baseline:  # nouveaux : déjà traités ci-dessus
+                    continue
+                ip_known = info["ip"]
+                print(f"  [*] IDS pulse sur {ip_known} ...")
+                entries_k, os_k = port_scan(ip_known, args_known, timeout)
+                if not entries_k:
+                    continue  # scan vide (éteint/bloqué) : on ne casse pas la base
+                prior = ports_base.get(mac, {}).get("ports", [])
+                ports_now = ids_check_ports(
+                    config, ip_known, mac, entries_k, prior, ids_events
+                )
+                ports_base[mac] = {"ts": history_entry["ts"], "ports": ports_now}
+                save_ports_base(ports_base)
+                # le dossier d'identité se rafraîchit au même rythme
+                baseline.setdefault(mac, {}).update(
+                    enrich_device(
+                        ip_known, mac, info.get("vendor", ""), entries_k, os_k,
+                        config.get("enrich", {}),
                     )
-                    ports_base[mac] = {"ts": history_entry["ts"], "ports": ports_now}
-                    save_ports_base(ports_base)
+                )
 
     if vanished:
         lines = "\n".join(describe(mac, info) for mac, info in vanished.items())
@@ -500,7 +823,17 @@ def _scan_inner(config, baseline):
     for msg in messages:
         send_telegram(config, msg)
 
-    baseline.update(current)
+    # Suivi de présence : first_seen / last_seen / compteur, sans écraser
+    # les dossiers enrichis déjà enregistrés.
+    now_ts = history_entry["ts"]
+    for mac, info in current.items():
+        rec = baseline.setdefault(mac, {})
+        rec["ip"] = info["ip"]
+        rec["vendor"] = info.get("vendor", "") or rec.get("vendor", "")
+        rec.setdefault("first_seen", now_ts)
+        rec["last_seen"] = now_ts
+        rec["seen"] = int(rec.get("seen", 0)) + 1
+        rec.setdefault("ports", [])
     save_baseline(baseline)
 
     LAST_STATE.update(ts=history_entry["ts"], online=len(current))
@@ -561,7 +894,9 @@ def bot_respond(config, chat_id, text):
             "/name <ip> <nom> — renommer un appareil (ex : /name 192.168.1.42 TV salon)\n"
             "/unknown — nouveaux du dernier scan\n"
             "/recent — 5 derniers scans\n"
-            "/events — dernières alertes IDS"
+            "/events — dernières alertes IDS\n"
+            "/info <ip> — dossier détaillé d'un appareil 🕵️\n"
+            "/export — récupérer la base en document (csv ou json)"
         ))
     elif cmd == "/status":
         if LAST_STATE["ts"]:
@@ -619,7 +954,10 @@ def bot_respond(config, chat_id, text):
                 ""
             )
             tag = f" 👤 <b>{html.escape(alias)}</b>" if alias else ""
-            lines.append(f"• <code>{ip}</code> {vendor}{tag}")
+            typ = f" · {html.escape(str(info['type']))}" if info.get("type") else ""
+            last_seen = info.get("last_seen", "")
+            last = f" ({html.escape(last_seen)})" if last_seen else ""
+            lines.append(f"• <code>{ip}</code> {vendor}{typ}{tag}{last}")
         more = f"\n... et {len(devices) - 15} autres" if len(devices) > 15 else ""
         send_telegram(config, f"📱 <b>{len(devices)} appareil(s) connu(s)</b>\n" + "\n".join(lines) + more)
     elif cmd == "/events":
@@ -658,6 +996,70 @@ def bot_respond(config, chat_id, text):
             for h in hist
         )
         send_telegram(config, f"📜 <b>5 derniers scans</b>\n{lines}")
+    elif cmd == "/info":
+        parts = text.split()
+        if len(parts) < 2:
+            send_telegram(config, "💡 Usage : /info <ip_ou_mac>")
+            return
+        target = parts[1]
+        devices = load_baseline()
+        mac = next(
+            (m for m in devices
+             if devices[m].get("ip") == target or m == target.upper()),
+            None,
+        )
+        if not mac:
+            send_telegram(config,
+                          f"🤔 {html.escape(target)} inconnu — regarde /devices")
+            return
+        rec = devices[mac]
+        alias = alias_of(mac)
+        ports_base = load_ports_base().get(mac, {}).get("ports", [])
+        lines = [
+            f"🕵️ <b>Dossier : {html.escape(rec.get('ip', '?'))}</b>",
+            f"• MAC : <code>{mac}</code>",
+        ]
+        if alias:
+            lines.append(f"• 👤 Alias : <b>{html.escape(alias)}</b>")
+        if rec.get("vendor"):
+            lines.append(f"• Fabricant : {html.escape(rec['vendor'])}")
+        if rec.get("hostname"):
+            lines.append(f"• Hostname : {html.escape(rec['hostname'])}")
+        if rec.get("type"):
+            lines.append(
+                f"• Type : <b>{html.escape(str(rec['type']))}</b>"
+                f" (confiance {rec.get('confidence', '?')}%)"
+            )
+        if rec.get("os_family"):
+            lines.append(f"• OS : {html.escape(rec['os_family'])}")
+        if rec.get("os"):
+            lines.append(f"• OS nmap : {html.escape(rec['os'])}")
+        if rec.get("banner"):
+            lines.append(f"• Bannière HTTP : {html.escape(str(rec['banner']))}")
+        if rec.get("first_seen"):
+            lines.append(
+                f"• 1er contact : {html.escape(str(rec['first_seen']))} · dernier : "
+                f"{html.escape(str(rec.get('last_seen', '')))} · vu "
+                f"{rec.get('seen', '?')} fois"
+            )
+        if ports_base:
+            lines.append("• Ports ouverts : " +
+                         html.escape(" , ".join(ports_base[:10])))
+        for note in rec.get("notes", [])[:5]:
+            lines.append(f"   ℹ️ {html.escape(str(note))}")
+        send_telegram(config, "\n".join(lines))
+    elif cmd == "/export":
+        kind = "json" if "json" in text.lower() else "csv"
+        EXPORT_DIR.mkdir(exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = EXPORT_DIR / f"netmon_{stamp}.{kind}"
+        if kind == "json":
+            export_devices_json(path)
+        else:
+            export_devices_csv(path)
+        ok = send_telegram_document(config, path, caption="📦 Export netmon v4")
+        if not ok:
+            send_telegram(config, f"📄 Export écrit ici : {path}")
     else:
         send_telegram(config, "🤔 Commande inconnue — /help pour la liste")
 
@@ -737,8 +1139,14 @@ PAGE = """<!doctype html>
 <div class="card">
 <h2>📱 Appareils connus</h2>
 <table id="devices">
-  <tr><th>MAC</th><th>IP</th><th>Fabricant</th></tr>
+  <tr><th>Alias</th><th>Type</th><th>Fabricant</th><th>IP</th><th>Hostname</th>
+      <th>OS</th><th>Dernier aperçu</th></tr>
 </table>
+</div>
+
+<div class="card">
+<h2>📈 Appareils en ligne par scan</h2>
+<canvas id="chart" width="640" height="180" style="width:100%"></canvas>
 </div>
 
 <div class="card">
@@ -748,7 +1156,9 @@ PAGE = """<!doctype html>
 </table>
 </div>
 
-<p class="muted">API JSON : <a href="/api/state">/api/state</a></p>
+<p class="muted">API : <a href="/api/state">/api/state</a> ·
+<a href="/api/export">📦 export CSV</a> ·
+<a href="/api/export?kind=json">📦 export JSON</a></p>
 
 <script>
 const table = (id, rowsHtml) => { document.getElementById(id)
@@ -756,9 +1166,32 @@ const table = (id, rowsHtml) => { document.getElementById(id)
 
 fetch("/api/state").then(r => r.json()).then(state => {
   const devRows = Object.entries(state.devices).map(([mac, d]) =>
-    `<tr><td><code>${mac}</code></td><td>${d.ip}</td><td>${d.vendor || "?"}</td></tr>`
+    `<tr><td><strong>${d.alias || "&mdash;"}</strong></td>
+     <td>${d.type || "?"}${d.confidence ? ` <span class="badge">${d.confidence}%</span>` : ""}</td>
+     <td>${d.vendor || "?"}</td>
+     <td><code>${d.ip}</code></td>
+     <td>${d.hostname || ""}</td>
+     <td class="os">${d.os_family || d.os || ""}</td>
+     <td class="muted">${d.last_seen || ""}</td></tr>`
   ).join("");
   table("devices", devRows);
+
+  // 📈 graphique de présence : nb d'appareils par scan (60 derniers)
+  const pts = state.history.slice(0, 60).reverse();
+  const cvs = document.getElementById("chart");
+  const ctx = cvs.getContext("2d");
+  ctx.fillStyle = "#0d1117";
+  ctx.fillRect(0, 0, cvs.width, cvs.height);
+  ctx.strokeStyle = "#58a6ff";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  const maxY = Math.max(1, ...pts.map(h => h.online || 0));
+  pts.forEach((h, i) => {
+    const x = 10 + i * (cvs.width - 20) / Math.max(pts.length - 1, 1);
+    const y = cvs.height - 15 - (h.online || 0) * (cvs.height - 30) / maxY;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.stroke();
 
   const histRows = state.history.map(h => {
     const news = h.new.map(n =>
@@ -780,15 +1213,36 @@ fetch("/api/state").then(r => r.json()).then(state => {
 class WebHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/api/state":
-            state = {
-                "devices": load_baseline(),
-                "history": load_history(),
+            aliases = load_aliases()
+            devices = {
+                mac: {**rec, "alias": aliases.get(mac, "")}
+                for mac, rec in load_baseline().items()
             }
+            state = {"devices": devices, "history": load_history()}
             body = json.dumps(state, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(body)
+        elif self.path.startswith("/api/export"):
+            kind = "json" if "kind=json" in self.path else "csv"
+            EXPORT_DIR.mkdir(exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            if kind == "json":
+                path = EXPORT_DIR / f"netmon_{stamp}.json"
+                ctype = "application/json"
+                export_devices_json(path)
+            else:
+                path = EXPORT_DIR / f"netmon_{stamp}.csv"
+                ctype = "text/csv; charset=utf-8"
+                export_devices_csv(path)
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header(
+                "Content-Disposition", f'attachment; filename="{path.name}"'
+            )
+            self.end_headers()
+            self.wfile.write(path.read_bytes())
         elif self.path == "/":
             body = PAGE.replace(
                 "__DEVICES_COUNT__", str(len(load_baseline()))

@@ -3,6 +3,12 @@
   "interval_sec": 300,
   "notify_vanished": false,
   "os_detection": false,
+  "enrich": {
+    "enabled": true,
+    "reverse_dns": true,
+    "ping_ttl": true,
+    "compare_gateway": true
+  },
   "ids": {
     "enabled": true,
     "watch_known": true,
